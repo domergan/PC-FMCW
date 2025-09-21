@@ -12,6 +12,8 @@ from helpers import print_config, \
                     RangeTimePlot,\
                     SpectrumPlot, \
                     MTIFilter
+                    
+from phase_code import make_tx_buffer
 
 import adi
 
@@ -23,7 +25,7 @@ center_freq = 2.1e9
 signal_freq = 100e3 # range bias (added to avoid DC noise, 1/f, 50Hz, ...)
 rx_gain     = 30   # must be between -3 and 70
 output_freq = 10e9
-chirp_bw    = 300e6
+chirp_bw    = 500e6
 ramp_time   = 500      # ramp time in us
 plot_freq   = 200e3    # x-axis freq range to plot (eg max range)
 
@@ -49,7 +51,7 @@ my_phaser = adi.CN0566(uri=rpi_ip, sdr=my_sdr)
 
 setup_phaser(my_phaser, chirp_bw, output_freq, signal_freq, center_freq, ramp_time)
 setup_sdr(my_sdr, sample_rate, center_freq, rx_gain)
-tdd, num_chirps, sdr_pins = setup_tdd(sdr_ip, ramp_time)
+tdd, sdr_pins = setup_tdd(sdr_ip, ramp_time)
 
 """determine sampling time"""
 
@@ -69,29 +71,16 @@ print("good ramp samples = ", good_ramp_samples)
 
 """determine buffer sizes"""
 
-# size the fft for the number of ramp data points
+# get the nearest power 2 integer of good_ramp_samples
 power=8
 fft_size = int(2**power)
-num_samples_frame = int(tdd.frame_length_ms/1000*sample_rate)
-while num_samples_frame > fft_size:     
+while good_ramp_samples > fft_size:     
     power=power+1
     fft_size = int(2**power) 
     if power==18:
         break
     
-# Pluto receive buffer size needs to be greater than total time for all chirps
-total_time = tdd.frame_length_ms * num_chirps   # time in ms
-
-buffer_time = 0
-power=12
-while total_time > buffer_time:     
-    power=power+1
-    buffer_size = int(2**power) 
-    buffer_time = buffer_size/my_sdr.sample_rate*1000   # buffer time in ms
-    if power==23:
-        break     # max pluto buffer size is 2**23, but for tdd burst mode, set to 2**22
-        
-my_sdr.rx_buffer_size = buffer_size
+my_sdr.rx_buffer_size = fft_size
 
 """print parameters"""
 
@@ -107,16 +96,36 @@ i = np.cos(2 * np.pi * t * fc) * 2 ** 14
 q = np.sin(2 * np.pi * t * fc) * 2 ** 14
 iq = 1 * (i + 1j * q)
 
+# hardcoded for testing
+# phases = [np.pi, 0, np.pi, 0, np.pi]
+
+# iq, t, phase_samples = make_tx_buffer(phases, 
+#                                       int(signal_freq), 
+#                                       float(sample_rate), 
+#                                       fft_size, 
+#                                       start_phase=0.0)
+
+# iq = iq * 2**14
+
 # transmit data from Pluto
 my_sdr._ctx.set_timeout(30000)
 my_sdr._rx_init_channels()
 my_sdr.tx([iq, iq])
 
+
+""" plotting """
+
 # Prime one frame
-freq0, s_dbfs0 = update(my_sdr, my_phaser, num_chirps,
-                        good_ramp_samples, start_offset_samples,
-                        fft_size, num_samples_frame)
-dt_frame = (tdd.frame_length_ms * num_chirps) / 1000.0
+freq0, s_dbfs0, _ = update(my_sdr, 
+                        my_phaser,
+                        good_ramp_samples, 
+                        start_offset_samples,
+                        fft_size,  
+                        sample_rate, 
+                        K=chirp_bw/ramp_time
+                    )
+
+dt_frame = (tdd.frame_length_ms) / 1000.0
 
 print("dt_frame =", dt_frame)
 
@@ -124,36 +133,61 @@ print("dt_frame =", dt_frame)
 vmin0, vmax0 = np.percentile(s_dbfs0[np.isfinite(s_dbfs0)], [5, 99])
 
 rt_plot = RangeTimePlot(
-    freq=freq0, chirp_bw=chirp_bw, ramp_time_s=ramp_time_s, dt=dt_frame,
-    history=200, fmax=plot_freq,
+    freq=freq0, 
+    chirp_bw=chirp_bw, 
+    ramp_time_s=ramp_time_s, 
+    dt=dt_frame,
+    history=200, 
+    fmax=plot_freq,
     use_cfar=USE_CFAR,
-    fast=FAST_PLOTTING, decimate=DECIMATE_RANGE, scroll_labels=SCROLL_LABELS,
-    fixed_vmin=vmin0, fixed_vmax=vmax0, show_colorbar=True, offset_hz=signal_freq
+    fast=FAST_PLOTTING, 
+    decimate=DECIMATE_RANGE, 
+    scroll_labels=SCROLL_LABELS,
+    fixed_vmin=vmin0, 
+    fixed_vmax=vmax0, 
+    show_colorbar=True, 
+    offset_hz=signal_freq
 )
+
 rt_plot.push(freq0, s_dbfs0)
 
 # Spectrum
 spec_plot = SpectrumPlot(
-    freq0, fmax=plot_freq, use_cfar=USE_CFAR,
-    fast=FAST_PLOTTING, decimate=DECIMATE_SPEC, auto_ylim_every=AUTO_SPEC_Y_EVERY
+    freq0, 
+    fmax=plot_freq, 
+    use_cfar=USE_CFAR,
+    fast=FAST_PLOTTING, 
+    decimate=DECIMATE_SPEC, 
+    auto_ylim_every=AUTO_SPEC_Y_EVERY
 )
+
 spec_plot.update(freq0, s_dbfs0)
 
 mti = MTIFilter(mode=MTI_MODE, alpha=MTI_ALPHA) if USE_MTI else None
 
 plt.ion()
+# fig_td = plt.figure("time domain iq")
 try:
     while True:
-        freq, s_dbfs = update(my_sdr, my_phaser, num_chirps,
-                              good_ramp_samples, start_offset_samples,
-                              fft_size, num_samples_frame)
+        freq, s_dbfs, rx_iq = update(my_sdr, 
+                              my_phaser,
+                              good_ramp_samples,
+                              start_offset_samples,
+                              fft_size, 
+                              sample_rate,
+                              K = chirp_bw/ramp_time)
         
+        # plt.plot(np.angle(rx_iq))
+        # plt.draw()
+        # plt.pause(0.0001)
+        # plt.clf()
+       
         if USE_MTI:
             s_dbfs = mti.process_db(s_dbfs)
     
         rt_plot.push(freq, s_dbfs)
         spec_plot.update(freq, s_dbfs)
-        plt.pause(0.01)  
+        # plt.pause(0.05)  
 except KeyboardInterrupt:
     end_program(my_sdr, tdd, sdr_pins)
 

@@ -12,6 +12,8 @@ import adi
 
 from mmwave.dsp.cfar import os
 
+from phase_code import design_group_delay_allpass, make_tx_buffer
+
 
 CFAR_METHOD  = 'false_alarm'   # 'average' | 'greatest' | 'smallest' | 'false_alarm'
 CFAR_BIAS    = 0.065         # additive bias in *linear amplitude* units
@@ -156,42 +158,71 @@ def setup_sdr(sdr, sample_rate, center_freq, rx_gain):
     sdr.tx_hardwaregain_chan1 = -0  # must be between 0 and -88
     
 def setup_tdd(sdr_ip, ramp_time):
-    # Configure TDD controller
+    
     sdr_pins = adi.one_bit_adc_dac(sdr_ip)
-    sdr_pins.gpio_tdd_ext_sync = True # If set to True, this enables external capture triggering using the L24N GPIO on the Pluto.  When set to false, an internal trigger pulse will be generated every second
+    
+    # If set to True, this enables external capture triggering using the L24N GPIO on the Pluto.  
+    # When set to false, an internal trigger pulse will be generated every second
+    sdr_pins.gpio_tdd_ext_sync = True 
+    
     tdd = adi.tddn(sdr_ip)
     sdr_pins.gpio_phaser_enable = True
     tdd.enable = False         # disable TDD to configure the registers
     tdd.sync_external = True
+    
+    # Initial delay before the first frame (ms)
     tdd.startup_delay_ms = 0
-    PRI_ms = ramp_time/1e3 + 1.0 # in ms
-    tdd.frame_length_ms = PRI_ms    # each chirp is spaced this far apart
     
-    num_chirps = 1
+    # in ms (0.5 + 1 = 1.5ms)
+    PRI_ms = ramp_time/1e3 + 1.0 
     
-    tdd.burst_count = num_chirps       # number of chirps in one continuous receive buffer
-
-    tdd.channel[0].enable = True
+    # each chirp is spaced this far apart
+    tdd.frame_length_ms = PRI_ms    
+    
+    # Amount of frames to produce, where 0 means repeat indefinitely
+    tdd.burst_count = 1 # one chirp per burst
+    
+    """
+    The Generic TDD Engine was integrated to output a logic signal on the L10P pin, which connects to the input of the ADF4159,
+    when receiving an external synchronization signal on the L12N pin from the Raspberry Pi. Two additional TDD channels are used
+    to synchronize the TX/RX DMA transfer start:
+        - TDD CH1 is connected to the RX DMA, triggering the synchronization flag;
+        - TDD CH2 is connected to the TX unpacker's reset, backpressuring the TX DMA until deasserted.
+    """
+    
+    # Channel 0 controls TXDATA so the chirp generation by the PLL
+    # TXDATA_1V8, Pluto L10P pin
+    tdd.channel[0].enable   = True
     tdd.channel[0].polarity = False
-    tdd.channel[0].on_raw = 0
-    tdd.channel[0].off_raw = 10
-    tdd.channel[1].enable = True
-    tdd.channel[1].polarity = False
-    tdd.channel[1].on_raw = 0
-    tdd.channel[1].off_raw = 10
-    tdd.channel[2].enable = True
+    tdd.channel[0].on_raw   = 0
+    tdd.channel[0].off_raw  = 10
+    
+    # Channel 1 controls the start timing for pluto RX buffer
+    # RX DMA transfer start sync
+    tdd.channel[1].enable   = True
+    tdd.channel[1].polarity = False 
+    tdd.channel[1].on_raw   = 0
+    tdd.channel[1].off_raw  = 10
+    
+    # Channel 2 controls the start timing for pluto TX buffer
+    # TX DMA SYNC
+    tdd.channel[2].enable   = True
     tdd.channel[2].polarity = False
-    tdd.channel[2].on_raw = 0
-    tdd.channel[2].off_raw = 10
+    tdd.channel[2].on_raw   = 0
+    tdd.channel[2].off_raw  = 10
+    
     tdd.enable = True
     
-    return tdd, num_chirps, sdr_pins
+    return tdd, sdr_pins
     
 def end_program(sdr, tdd, sdr_pins):
     """ Gracefully shutsdown the program and Pluto
     """
+    
     sdr.tx_destroy_buffer()
+    
     print("Program finished and Pluto Tx Buffer Cleared")
+    
     # disable TDD and revert to non-TDD (standard) mode
     tdd.enable = False
     sdr_pins.gpio_phaser_enable = False
@@ -201,10 +232,11 @@ def end_program(sdr, tdd, sdr_pins):
     tdd.enable = False
     
 
-def update(sdr, phaser, num_chirps, good_ramp_samples, start_offset_samples, fft_size, num_samples_frame):
+def update(sdr, phaser, good_ramp_samples, start_offset_samples, fft_size, fs, K):
     """ Updates the FFT in the window
 	"""
-    # trigger one ramp
+    # toggles low->high->low from the raspberry pi
+    # this triggers a ramp and buffer start (Pluto L12N pin)
     phaser._gpios.gpio_burst = 0
     phaser._gpios.gpio_burst = 1
     phaser._gpios.gpio_burst = 0
@@ -214,20 +246,45 @@ def update(sdr, phaser, num_chirps, good_ramp_samples, start_offset_samples, fft
     chan1 = data[0]
     chan2 = data[1]
     sum_data = chan1+chan2
-    
+
     # select just the linear portion of the last chirp
-    rx_bursts = np.zeros((num_chirps, good_ramp_samples), dtype=complex)
-    for burst in range(num_chirps):
-        start_index = start_offset_samples + burst*num_samples_frame
-        stop_index = start_index + good_ramp_samples
-        rx_bursts[burst] = sum_data[start_index:stop_index]
-        burst_data = np.ones(fft_size, dtype=complex)*1e-10
-        win_funct = np.blackman(len(rx_bursts[burst]))
-        #win_funct = np.ones(len(rx_bursts[burst]))
-        burst_data[start_offset_samples:(start_offset_samples+good_ramp_samples)] = rx_bursts[burst]*win_funct
+    rx_bursts   = np.zeros(good_ramp_samples, dtype=complex)
+    start_index = start_offset_samples
+    stop_index  = start_index + good_ramp_samples
+    rx_bursts   = sum_data[start_index:stop_index]
+    burst_data  = np.ones(fft_size, dtype=complex)*1e-10
+    win_funct   = np.blackman(len(rx_bursts))
+    
+    burst_data[start_offset_samples:(start_offset_samples+good_ramp_samples)] = rx_bursts*win_funct
+    
+    # apply filter on good samples
+    H, f, phi = design_group_delay_allpass(len(burst_data), fs, K, f_max=fs/2)
+    X = np.fft.fft(burst_data)
+    Y = H * X
+    burst_data = np.fft.ifft(Y) 
     
     
-    # do fft
+    # burst_data should be aligned be now  
+    
+    # phases = [np.pi, 0, np.pi, 0, np.pi]
+    
+    # tx_ref, _, _ = make_tx_buffer(
+    #     phases=phases,   # your phase code per chip
+    #     fc=0.0,          # IMPORTANT: 0 so we only get the code envelope
+    #     fs=fs,
+    #     num_samples=good_ramp_samples,
+    #     start_phase=0.0
+    # )
+
+    # # ... after: burst_data = np.fft.ifft(Y)
+    # start = start_offset_samples
+    # stop  = start + good_ramp_samples
+    
+    # # decoding
+    # burst_data[start:stop] *= tx_ref
+
+
+    # magnitude of fft
     sp = np.absolute(np.fft.fft(burst_data))
     sp = np.fft.fftshift(sp)
     s_mag = np.abs(sp) / np.sum(win_funct)
@@ -235,10 +292,10 @@ def update(sdr, phaser, num_chirps, good_ramp_samples, start_offset_samples, fft
     s_dbfs = 20 * np.log10(s_mag / (2 ** 11))
     
     # frequency range from fs
-    sample_rate = sdr.sample_rate
-    freq = np.linspace(-sample_rate / 2, sample_rate / 2, int(fft_size))
+    freq = np.linspace(-fs / 2, fs / 2, int(fft_size))
     
-    return freq, s_dbfs
+    # return burst_data too for debugging purposes
+    return freq, s_dbfs, burst_data
 
 
 class RangeTimePlot:

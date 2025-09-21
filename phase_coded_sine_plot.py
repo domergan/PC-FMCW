@@ -1,27 +1,5 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Sun Sep 21 10:43:45 2025
-
-@author: Bertrand
-"""
 import numpy as np
 import matplotlib.pyplot as plt
-
-def design_group_delay_allpass(N, fs, K, f_max):
-    """
-    Frequency-domain all-pass with |H|=1 and phase:
-        phase(H(f)) = (2*pi*f)/K * (f/2 - f_max)
-    If for_real_signal=True, enforce Hermitian symmetry so IFFT is real.
-    If False (complex signals), apply the phase to signed frequencies directly.
-    """
-    f = np.fft.fftfreq(N, d=1.0/fs)  # signed frequencies (Hz)
-
-    # Complex signal
-    phi = (2*np.pi*f)/K * (0.5*f - f_max)
-    
-    H = np.exp(1j * phi)
-    return H, f, phi
-
 
 def make_tx_buffer(phases, fc, fs, num_samples, start_phase=0.0):
 
@@ -41,3 +19,22 @@ def make_tx_buffer(phases, fc, fs, num_samples, start_phase=0.0):
     iq = np.exp(1j * (2*np.pi*fc*t + start_phase + phase_per_sample))
     return iq, t, phase_per_sample
 
+
+
+fs = 2_000_000
+fc = 100e3
+phases = [0, np.pi, 0, np.pi]
+N = 10
+
+iq, t, phase_samples = make_tx_buffer(phases, fc, fs, N)
+
+plt.figure()
+plt.plot(t, np.real(iq))                # or np.abs(iq)
+plt.title('Phase-coded sine (1000 samples total)')
+plt.xlabel('Time (s)'); plt.ylabel('Amplitude'); plt.grid(True)
+
+plt.figure()
+plt.step(t, phase_samples, where='post')
+plt.title('Per-sample phase offsets φ_k (radians)')
+plt.xlabel('Time (s)'); plt.ylabel('Phase (rad)'); plt.grid(True)
+plt.show()
